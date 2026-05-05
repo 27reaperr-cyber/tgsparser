@@ -91,7 +91,9 @@ function tgsToJson(tgsBuffer) {
 }
 
 // ---------- TELEGRAM BOT ----------
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+// FIX: polling: false при создании, потом вручную удаляем webhook и стартуем polling.
+// Это устраняет 409 Conflict — старый инстанс успевает завершиться до старта нового.
+const bot = new TelegramBot(BOT_TOKEN, { polling: false });
 
 const mainMenu = {
   reply_markup: {
@@ -177,8 +179,13 @@ bot.on('callback_query', async (q) => {
     }
     await bot.answerCallbackQuery(q.id);
   } catch (e) {
-    console.error('callback error', e);
-    await bot.answerCallbackQuery(q.id, { text: 'Ошибка', show_alert: false });
+    console.error('callback error', e.message);
+    // FIX: игнорируем "message is not modified" — не критическая ошибка
+    if (!e.message?.includes('message is not modified')) {
+      await bot.answerCallbackQuery(q.id, { text: 'Ошибка', show_alert: false }).catch(() => {});
+    } else {
+      await bot.answerCallbackQuery(q.id).catch(() => {});
+    }
   }
 });
 
@@ -265,7 +272,17 @@ bot.on('message', async (msg) => {
     bot.editMessageText(
       `❌ Ошибка: <code>${(e.message || 'unknown').slice(0, 200)}</code>`,
       { chat_id: msg.chat.id, message_id: status.message_id, parse_mode: 'HTML' },
-    );
+    ).catch(() => {});
+  }
+});
+
+// FIX: Обработка polling ошибок — не падаем при сетевых сбоях
+bot.on('polling_error', (err) => {
+  // 409 логируем как warning, не как error — это значит был другой инстанс
+  if (err.code === 'ETELEGRAM' && err.message.includes('409')) {
+    console.warn('⚠️  [polling] 409 Conflict — завершение старого инстанса...');
+  } else {
+    console.error('[polling_error]', err.message);
   }
 });
 
@@ -278,6 +295,8 @@ app.get('/', (_req, res) => {
 });
 
 app.get('/:slug', (req, res) => {
+  // FIX: исключаем /api/* из slug-маршрута
+  if (req.params.slug === 'api') return res.status(404).type('html').send(render404());
   const pack = getPack.get(req.params.slug);
   if (!pack || pack.expires_at < Date.now()) {
     return res.status(404).type('html').send(render404());
@@ -285,7 +304,7 @@ app.get('/:slug', (req, res) => {
   res.type('html').send(renderPack(pack));
 });
 
-// API: отдать tgs base64 → клиент уже сам конвертит
+// API: мета-информация пака
 app.get('/api/pack/:slug', (req, res) => {
   const pack = getPack.get(req.params.slug);
   if (!pack || pack.expires_at < Date.now()) return res.status(404).json({ error: 'not found' });
@@ -347,6 +366,21 @@ app.get('/api/pack/:slug/json/:idx', (req, res) => {
   try {
     const json = tgsToJson(Buffer.from(it.tgs_b64, 'base64'));
     res.set('Content-Disposition', `attachment; filename="${it.name}.json"`);
+    res.json(json);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Lottie JSON для плеера (декодит .tgs на лету)
+app.get('/api/pack/:slug/lottie/:idx', (req, res) => {
+  const pack = getPack.get(req.params.slug);
+  if (!pack || pack.expires_at < Date.now()) return res.status(404).end();
+  const items = JSON.parse(pack.items_json);
+  const it = items[+req.params.idx];
+  if (!it) return res.status(404).end();
+  try {
+    const json = tgsToJson(Buffer.from(it.tgs_b64, 'base64'));
     res.json(json);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -482,22 +516,38 @@ function renderPack(pack) {
   ` + BASE_FOOT;
 }
 
-// Lottie JSON для плеера (декодит .tgs на лету)
-app.get('/api/pack/:slug/lottie/:idx', (req, res) => {
-  const pack = getPack.get(req.params.slug);
-  if (!pack || pack.expires_at < Date.now()) return res.status(404).end();
-  const items = JSON.parse(pack.items_json);
-  const it = items[+req.params.idx];
-  if (!it) return res.status(404).end();
+// ---------- ЗАПУСК ----------
+// FIX: сначала стартуем Express, потом удаляем webhook и запускаем polling
+app.listen(PORT, async () => {
+  console.log(`🌐 Web: http://localhost:${PORT}`);
+  console.log(`🤖 Bot: домен ${DOMAIN}`);
+
   try {
-    const json = tgsToJson(Buffer.from(it.tgs_b64, 'base64'));
-    res.json(json);
+    // Удаляем возможный webhook и сбрасываем pending updates перед polling
+    await bot.deleteWebHook({ drop_pending_updates: true });
+    console.log('✅ Webhook удалён, pending updates сброшены');
+    bot.startPolling({ restart: false });
+    console.log('✅ Polling запущен');
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    console.error('❌ Ошибка запуска polling:', e.message);
+    process.exit(1);
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`🌐 Web: http://localhost:${PORT}`);
-  console.log(`🤖 Bot: запущен, домен ${DOMAIN}`);
-});
+// ---------- GRACEFUL SHUTDOWN ----------
+// FIX: корректное завершение — останавливаем polling перед выходом,
+// чтобы следующий запуск не получал 409 Conflict
+async function shutdown(signal) {
+  console.log(`\n🛑 ${signal} получен, завершаю...`);
+  try {
+    await bot.stopPolling();
+    console.log('✅ Polling остановлен');
+  } catch (e) {
+    console.error('Ошибка при остановке polling:', e.message);
+  }
+  db.close();
+  process.exit(0);
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
